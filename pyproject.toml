@@ -4,12 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asilib"
-version = "0.23.0"
+version = "0.26.5"
 description = "An open source package providing data access and analysis tools for the world's all-sky imager (ASI) data."
 keywords = [ "aurora", "all sky imager", "REGO", "THEMIS", "TREx",]
+license = {text = "BSD 3-Clause"}
 classifiers = [
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
-
     "Programming Language :: Python :: 3", 
     "Programming Language :: Python :: 3.9", 
     "Programming Language :: Python :: 3.10", 
@@ -24,7 +23,6 @@ dependencies = [
     "scipy >= 1.10.0",
     "pandas", 
     "matplotlib >= 3.7, <4.0", 
-    "cdflib >= 0.3.20", 
     "ffmpeg-python", 
     "pymap3d", 
     "aacgmv2", 
@@ -58,3 +56,16 @@ asilib = [ "*.csv", "*.zip",]
 
 [tool.setuptools.packages.find]
 namespaces = false
+
+[tool.pytest.ini_options]
+addopts = "--cov=asilib --cov-report term:skip-covered"
+
+[tool.coverage.run]
+omit = [
+    "tests//*",
+    "examples//*",
+    "__main__.py",
+    "setup.py",
+    "asilib//asi//psa_emccd.py",
+    "asilib//asi//lamp_phantom.py",
+    ]

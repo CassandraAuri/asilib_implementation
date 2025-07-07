@@ -1,7 +1,6 @@
 """
 The THEMIS ground-based All-Sky Imager (ASI) array observes the white light aurora over the North American continent from Canada to Alaska. The ASI array consists of 20 cameras covering a large section of the auroral oval with one-kilometer resolution. The all-sky imagers are time synchronized and have an image repetition rate of three seconds. During northern winter, continuous coverage is available from about 00:00-15:00 UT covering approximately 17-07 MLT for each individual site. Geographic locations and more details are available using asilib.asi.themis.themis_info(). The full-resolution 256x256 pixel images are transferred via hard-disk swap and become available approximately 3-5 months after data collection.
 """
-
 from datetime import datetime, timedelta
 from multiprocessing import Pool
 import re
@@ -20,7 +19,7 @@ import themis_imager_readfile
 
 import asilib
 import asilib.utils as utils
-import asilib.io.download as download
+import asilib.download as download
 import asilib.skymap
 
 
@@ -168,7 +167,10 @@ def themis(
         'cadence': 3,
         'resolution': (256, 256),
     }
-    return imager(file_info, meta, skymap)
+    plot_settings = {
+        'color_bounds': (3000, 9000)  # A decent default
+    }
+    return imager(file_info, meta, skymap, plot_settings=plot_settings)
 
 
 def themis_skymap(location_code, time, redownload):
@@ -256,6 +258,7 @@ def _get_pgm_files(
     save_dir: Union[str, pathlib.Path],
     redownload: bool,
     missing_ok: bool,
+    file_search_str: str = None,
 ) -> List[pathlib.Path]:
     """
     Look for and download 1-minute PGM files.
@@ -296,8 +299,15 @@ def _get_pgm_files(
     if redownload:
         # Option 1/4: Download one minute of data regardless if it is already saved
         if time is not None:
+            if file_search_str is None:
+                _file_search_str = f'{time.strftime("%Y%m%d_%H%M")}_{location_code.lower()}*{array}*.pgm.gz'
+            else:
+                _file_search_str = file_search_str(time, location_code, array)
             return [
-                _download_one_pgm_file(array, location_code, time, base_url, save_dir, redownload)
+                _download_one_pgm_file(
+                    array, location_code, time, base_url, save_dir, redownload, 
+                    file_search_str=_file_search_str
+                    )
             ]
 
         # Option 2/4: Download the data in time range regardless if it is already saved.
@@ -306,16 +316,22 @@ def _get_pgm_files(
             file_times = utils.get_filename_times(time_range, dt='minutes')
             file_paths = []
             for file_time in file_times:
+                if file_search_str is None:
+                    _file_search_str = f'{file_time.strftime("%Y%m%d_%H%M")}_{location_code.lower()}*{array}*.pgm.gz'
+                else:
+                    _file_search_str = file_search_str(file_time, location_code, array)
                 try:
                     file_paths.append(
                         _download_one_pgm_file(
-                            array, location_code, file_time, base_url, save_dir, redownload
+                            array, location_code, file_time, base_url, save_dir, redownload, 
+                            file_search_str=_file_search_str
                         )
                     )
-                except (FileNotFoundError, AssertionError) as err:
+                except (FileNotFoundError, AssertionError, requests.exceptions.HTTPError) as err:
                     if missing_ok and (
-                        ('does not contain any hyper references containing' in str(err))
-                        or ('Only one href is allowed' in str(err))
+                        ('does not contain any hyper references containing' in str(err)) or
+                        ('Only one href is allowed' in str(err)) or
+                        ('404 Client Error: Not Found for url:' in str(err))
                     ):
                         continue
                     raise
@@ -323,14 +339,18 @@ def _get_pgm_files(
     else:
         # Option 3/4: Download one minute of data if it is not already saved.
         if time is not None:
-            file_search_str = f'{time.strftime("%Y%m%d_%H%M")}_{location_code.lower()}*.pgm.gz'
-            local_file_paths = list(pathlib.Path(save_dir).rglob(file_search_str))
+            if file_search_str is None:
+                _file_search_str = f'{time.strftime("%Y%m%d_%H%M")}_{location_code.lower()}*{array}*.pgm.gz'
+            else:
+                _file_search_str = file_search_str(time, location_code, array)
+            local_file_paths = list(pathlib.Path(save_dir).rglob(_file_search_str))
             if len(local_file_paths) == 1:
                 return local_file_paths
             else:
                 return [
                     _download_one_pgm_file(
-                        array, location_code, time, base_url, save_dir, redownload
+                        array, location_code, time, base_url, save_dir, redownload, 
+                        file_search_str=_file_search_str
                     )
                 ]
 
@@ -340,17 +360,19 @@ def _get_pgm_files(
             file_times = utils.get_filename_times(time_range, dt='minutes')
             file_paths = []
             for file_time in file_times:
-                file_search_str = (
-                    f'{file_time.strftime("%Y%m%d_%H%M")}_{location_code.lower()}*.pgm.gz'
-                )
-                local_file_paths = list(pathlib.Path(save_dir).rglob(file_search_str))
+                if file_search_str is None:
+                    _file_search_str = f'{file_time.strftime("%Y%m%d_%H%M")}_{location_code.lower()}*{array}*.pgm.gz'
+                else:
+                    _file_search_str = file_search_str(file_time, location_code, array)
+                local_file_paths = list(pathlib.Path(save_dir).rglob(_file_search_str))
                 if len(local_file_paths) == 1:
                     file_paths.append(local_file_paths[0])
                 else:
                     try:
                         file_paths.append(
                             _download_one_pgm_file(
-                                array, location_code, file_time, base_url, save_dir, redownload
+                                array, location_code, file_time, base_url, save_dir, redownload, 
+                                file_search_str=_file_search_str
                             )
                         )
                     except (FileNotFoundError, AssertionError, requests.exceptions.HTTPError) as err:
@@ -382,6 +404,7 @@ def _download_one_pgm_file(
     base_url: str,
     save_dir: Union[str, pathlib.Path],
     redownload: bool,
+    file_search_str: callable=None
 ) -> pathlib.Path:
     """
     Download one PGM file.
@@ -400,6 +423,8 @@ def _download_one_pgm_file(
         The parent directory where to save the data to.
     redownload: bool
         Will redownload an existing file.
+    file_search_str: Callable
+        A function that takes in (time, location_code, array) arguments and returns a string filename to pass into glob.
 
     Returns
     -------
@@ -407,20 +432,24 @@ def _download_one_pgm_file(
         Local path to file.
     """
     start_url = base_url + f'{time.year}/{time.month:02}/{time.day:02}/'
-    d = download.Downloader(start_url)
+    d = download.Downloader(start_url, headers={'User-Agent':'asilib'})
     # Find the unique directory
     matched_downloaders = d.ls(f'{location_code.lower()}_{array}*')
     assert len(matched_downloaders) == 1
     # Search that directory for the file and donload it.
-    d2 = download.Downloader(matched_downloaders[0].url + f'ut{time.hour:02}/')
-    file_search_str = f'{time.strftime("%Y%m%d_%H%M")}_{location_code.lower()}*{array}*.pgm.gz'
+    d2 = download.Downloader(
+        matched_downloaders[0].url + f'ut{time.hour:02}/', 
+        headers={'User-Agent':'asilib'}
+        )
     matched_downloaders2 = d2.ls(file_search_str)
-    assert len(matched_downloaders2) == 1
+    assert len(matched_downloaders2) == 1, (
+        f'Found {len(matched_downloaders2)} files (not 1) at URLs: {[d.url for d in matched_downloaders2]}.'
+        )
     return matched_downloaders2[0].download(save_dir, redownload=redownload)
 
 
 def _download_all_skymaps(location_code, url, save_dir, redownload):
-    d = download.Downloader(url)
+    d = download.Downloader(url, headers={'User-Agent':'asilib'})
     # Find the dated subdirectories
     ds = d.ls(f'{location_code.lower()}')
 

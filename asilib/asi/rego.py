@@ -3,6 +3,7 @@ As part of the Canadian Space Agency's Geospace Observatory (GO) Canada initiati
 """
 
 from datetime import datetime, timedelta
+import functools
 import re
 import warnings
 import pathlib
@@ -19,7 +20,7 @@ import rego_imager_readfile
 import asilib
 import asilib.asi.themis as themis
 import asilib.utils as utils
-import asilib.io.download as download
+import asilib.download as download
 import asilib.skymap
 
 
@@ -37,6 +38,8 @@ def rego(
     redownload: bool = False,
     missing_ok: bool = True,
     load_images: bool = True,
+    acknowledge: bool = True,
+    dark: bool = False,
     imager=asilib.Imager,
 ) -> asilib.Imager:
     """
@@ -74,6 +77,8 @@ def rego(
     load_images: bool
         Create an Imager object without images. This is useful if you need to
         calculate conjunctions and don't need to download or load unnecessary data.
+    acknowledge: bool
+        If True, prints the acknowledgment statement for REGO. 
     imager: asilib.Imager
         Controls what Imager instance to return, asilib.Imager by default. This
         parameter is useful if you need to subclass asilib.Imager.
@@ -113,6 +118,8 @@ def rego(
         time_range = utils.validate_time_range(time_range)
 
     local_pgm_dir = local_base_dir / 'images' / location_code.lower()
+    
+    file_search_str = functools.partial(_glob_filename, dark=dark)
 
     if load_images:
         # Download and find image data
@@ -125,6 +132,7 @@ def rego(
             local_pgm_dir,
             redownload,
             missing_ok,
+            file_search_str=file_search_str
         )
 
         start_times = len(file_paths) * [None]
@@ -191,10 +199,26 @@ def rego(
         'alt': float(_skymap['SITE_MAP_ALTITUDE']) / 1e3,
         'cadence': 3,
         'resolution': (512, 512),
+        'acknowledgment':(
+            'Redline Emission Geospace Observatory (REGO) data is courtesy of Space Environment '
+            'Canada (space-environment.ca). Use of the data must adhere to the rules of the road '
+            'for that dataset. Please see below for the required data acknowledgement. Any '
+            'questions about the REGO instrumentation or data should be directed to the University '
+            'of Calgary, Emma Spanswick (elspansw@ucalgary.ca) and/or Eric Donovan '
+            '(edonovan@ucalgary.ca).\n\n"The Redline Emission Geospace Observatory (REGO) is a joint '
+            'Canada Foundation for Innovation and Canadian Space Agency project developed by the '
+            'University of Calgary. REGO is operated and maintained by Space Environment Canada '
+            'with the support of the Canadian Space Agency (CSA) [23SUGOSEC]."'
+            )
     }
     plot_settings = {
-        'color_map': matplotlib.colors.LinearSegmentedColormap.from_list('black_to_red', ['k', 'r'])
+        'color_map': matplotlib.colors.LinearSegmentedColormap.from_list('black_to_red', ['k', 'r']),
+        'color_bounds':(300, 1000)
     }
+
+    if acknowledge and ('rego' not in asilib.config['ACKNOWLEDGED_ASIS']):
+        print(meta['acknowledgment'])
+        asilib.config['ACKNOWLEDGED_ASIS'].append('rego')   
     return imager(file_info, meta, skymap, plot_settings=plot_settings)
 
 
@@ -280,7 +304,7 @@ def rego_skymap(location_code: str, time: utils._time_type, redownload: bool = F
 
 
 def _download_all_skymaps(location_code, url, save_dir, redownload):
-    d = download.Downloader(url)
+    d = download.Downloader(url, headers={'User-Agent':'asilib'})
     # Find the dated subdirectories
     ds = d.ls(f'{location_code.lower()}')
 
@@ -350,3 +374,12 @@ def _load_rego_pgm(path):
         ]
     )
     return times, images
+
+def _glob_filename(time, location_code, _, dark=False):
+    """
+    Return a file search string to pass into asilib.Downloader.
+    """
+    if dark:
+        return f'{time.strftime("%Y%m%d_%H%M")}_{location_code.lower()}_rego*6300_dark.pgm.gz'
+    else:
+        return f'{time.strftime("%Y%m%d_%H%M")}_{location_code.lower()}_rego*6300.pgm.gz'

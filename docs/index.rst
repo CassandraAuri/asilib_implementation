@@ -1,4 +1,4 @@
-.. image:: ./_static/aurora-asi-lib_logo.png
+.. image:: ./_static/asilib_logo.png
   :alt: Alternative text
 
 **Last Built**: |today| | **Version**: |version| | **Source**: `github`_ | **Archive**: `zenodo`_.
@@ -21,7 +21,8 @@ Supported ASI arrays
 --------------------   
 - :ref:`rego_asi`,
 - :ref:`themis_asi`,
-- :ref:`trex_asi`
+- :ref:`trex_asi`,
+- :ref:`mango_asi`
 
 .. figure:: ./_static/global_coverage.png
    :alt: A geographic map showing the spatial coverage (field of view rings) of all imagers supported by asilib.
@@ -69,6 +70,5 @@ Lastly, asilib will not be possible without 1) everyone involved with designing,
    get_started
    examples
    tutorials
-   imager_api
-   function_api
+   api
    contribute

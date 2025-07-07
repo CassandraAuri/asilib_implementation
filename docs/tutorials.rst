@@ -9,5 +9,5 @@ Tutorials
    
    tutorials/basics
    tutorials/mosaics
+   tutorials/magnetic_equator
    tutorials/conjunctions
-   tutorials/legacy_tutorial

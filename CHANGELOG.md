@@ -1,5 +1,96 @@
 # Changelog
 
+## [0.26.4] - 2025-05-30
+
+### Changed
+- Standardized download exception handling.
+
+## [0.26.3] - 2025-05-22
+
+### Changed
+- Updated license metadata.
+
+## [0.26.2] - 2025-05-22
+
+### Changed
+- The license from GNU to BSD-3-Clause.
+
+## [0.26.1] - 2025-04-18
+
+### Changed 
+- Removed the `scipy.interpolate.interpnd._ndim_coords_from_arrays()` dependency since the latest version of scipy not longer has it.
+
+## [0.26.0] - 2025-04-09
+
+### Added
+- `Imagers.map_eq()` method maps images to the magnetic equator using a default IRBEM's IGRF model, or a custom magnetic field model. 
+- `Imagers.plot_map_eq()` method calls `Imagers.map_eq()` and plots the image.
+- A `magnetic_equator.ipynb` tutorial to the documentation.
+
+## [0.25.3] - 2025-03-12
+
+### Changed
+- Moved tests and examples into the top-level directory.
+- Updated `pyproject.toml` to automatically run pytest-cov. 
+
+## [0.25.2] - 2025-03-08
+
+### Added
+- TREx-RGB default `color_bounds`.
+- Added `Imager.auto_color_bounds()` to automatically calculate the color bounds based on a few images. This can be combined with `Imager.set_color_bounds()` to adjust the color bounds for a particular event.
+
+### Changed
+- Removed the `max_contrast` kwarg and now the contrast stretching algorithm is applied to all RGB images. It can be effectively turned off by setting `color_bounds=(0, 255)`.
+- Keograms are also contrast stretched
+- Simplified `Imager.get_color_bounds()` to return the default color bounds (`self.plot_settings['color_bounds']`).
+- Updated baseline images with the new color bounds.
+
+## [0.25.1] - 2025-01-25
+
+### Added
+- The `User-Agent` HTTP request header with the name `asilib` made to U. Calgary servers.
+- `Imager.get_color_bounds()` and `Imager.set_color_bounds()` methods. Now the color bounds are set for all images within a time_range using a subset of images.
+
+### Changed
+- `Imagers.animate_map_gen()` will now recalculate overlapping skyamps if one of the imagers turns on or off sometime in `time_range`.
+- Fixed a bug with a custom keogram. If the (lat, lon) skymaps define the image edges, the nearest pixels at the edge will give an index out of bounds error.
+- Fixed the broken README links.
+- Renamed `color_brighten` kwarg to `max_contrast` as it is the correct term for the processing algorithm.
+
+## [0.25.0] - 2024-12-08
+
+### Added
+- The Mid-latitude All-sky-imaging Network for Geophysical Observations (MANGO) ASI array data loader.
+- MANGO tests and documentation
+
+### Changed
+- Updated the global coverage map with MANGO.
+
+## [0.24.1] - 2024-12-07
+
+### Changed
+- The `_pcolormesh_nan()` function in the imager.py module. This function incorrectly handled skymaps whose FOV was clipped by the CCD at one or more edges (e.g., TREx-RGB). The new implementation includes a `Skymap_Cleaner()` class that handles both: the low elevation masking, as well as removing NaNs from the (lat, lon) skymaps. Removing NaNs is similar to the old implementation, but is now done in polar coordinates. This change necessitated numerous minor refactoring changes in `imager.py` and `imagers.py`.
+
+## [0.24.0] - 2024-07-22
+
+### Changed
+- Removed all deprecated asilib functions and their documentation.
+- Incremented the pandas version on `docs/requirements.txt` to fix an issue with readthedocs not compiling.
+
+## [0.23.2] - 2024-07-20
+
+### Added
+- Added a kwarg to `asilib.asi.rego()`, `asilib.asi.trex_rgb()`, and `asilib.asi.trex_nir()`: acknowledge, which prints the acknowledgement everytime a new imager is loaded rather than once a month.
+- Removed acknowledge.py
+- Changed tests for acknowledgements
+
+## [0.23.1] - 2024-06-15
+
+### Added
+- The `asilib.acknowledge.acknowledge()` function. It should be called by each loader to print that ASI's acknowledgment statement either when 1) the first time the user calls the function, or 2) when it has been a month since it was last called.
+- Tests for `asilib.acknowledge.acknowledge()`.
+- Added the call to `asilib.acknowledge.acknowledge()` in `asilib.asi.rego()`, `asilib.asi.trex_rgb()`, and `asilib.asi.trex_nir()`.
+
 ## [0.23.0] - 2024-04-21
 
 ### Added

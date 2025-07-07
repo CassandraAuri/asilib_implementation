@@ -3,16 +3,27 @@ The Imagers class handles multiple Imager objects and coordinates plotting and a
 fisheye lens and mapped images. The mapped images are also called mosaics.
 """
 
-from typing import Tuple, List, Union, Generator
+from typing import Tuple, List, Union, Generator, Callable
 from collections import namedtuple
 import pathlib
 from datetime import datetime, timedelta
 import shutil
+import warnings
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors
+import matplotlib.collections
+import matplotlib.patches
+import scipy.interpolate
+from scipy.spatial import cKDTree
+try:
+    import IRBEM
+    _irbem_imported = True
+except ImportError:
+    _irbem_imported = False
 
-from asilib.imager import Imager, _haversine
+from asilib.imager import Imager, _haversine, Skymap_Cleaner
 import asilib.map
 import asilib.utils
 
@@ -133,11 +144,61 @@ class Imagers:
         >>> ax.set_title('Donovan et al. 2008 | First breakup of an auroral arc')
         >>> plt.show()
         """
-        if not overlap:
-            self._calc_overlap_mask()  # TODO: Put into a context manager.
+        if 'ax' not in kwargs:
+            kwargs['ax'] = asilib.map.create_map()
 
-        for imager in self.imagers:
-            imager.plot_map(**kwargs)
+        # If the kwarg is not specified, or is None, then it should just be None for all imagers.
+        # Below will be True if the kwarg['color_bounds'] is set as None, or if the key is missing.
+        if kwargs.get('color_bounds', None) is None:
+            color_bounds = np.full(len(self.imagers), None)
+        elif len(np.array(kwargs['color_bounds']).shape) == 1:  # Same color_bounds for all imagers.
+            color_bounds = np.repeat(
+                np.array(kwargs['color_bounds'])[:, np.newaxis], 
+                len(self.imagers), 
+                axis=-1
+                ).T
+        elif len(np.array(kwargs['color_bounds']).shape) == 2:
+            assert np.array(kwargs['color_bounds']).shape == (len(self.imagers), 2), (
+                "A unique color_bounds must be specified for each imager."
+                )
+            color_bounds = kwargs['color_bounds']
+        else:
+            raise ValueError(
+                f'The shape of color_bounds must be (1, 2), or '
+                f'({len(self.imagers)}, 2), not {np.array(kwargs["color_bounds"]).shape}'
+                )
+        # Must remove the color_bounds variable, if the kwargs dict contains it, 
+        # so the call to imager.plot_map() doesn't raise an error because of
+        # duplicate keyword arguments. 
+        kwargs.pop('color_bounds', None)
+
+        self._skymaps = {
+            _imager.meta['location']:{
+                'lon':_imager.skymap['lon'].copy(), 
+                'lat':_imager.skymap['lat'].copy(),
+                'el':_imager.skymap['el'].copy()
+                } for _imager in self.imagers
+            }
+        # If overlap=False, each skymap first has nans in the imager overlapping region,
+        # and then the skymap cleaner nans everything below min_elevation, which is then
+        # immediately followed by the reassignment of all nans to the nearest valid value.
+        if not overlap:
+            self._skymaps = self._calc_overlap_mask(self._skymaps, shrink_distance_to_self=0.96)
+
+        for imager, _color_bounds in zip(self.imagers, color_bounds):
+            _skymap_cleaner = Skymap_Cleaner(
+                self._skymaps[imager.meta['location']]['lon'], 
+                self._skymaps[imager.meta['location']]['lat'], 
+                self._skymaps[imager.meta['location']]['el'], 
+            )
+            _skymap_cleaner.mask_elevation(kwargs.get('min_elevation', 5))
+            _cleaned_lon_grid, _cleaned_lat_grid = _skymap_cleaner.remove_nans()
+            imager.plot_map(
+                **kwargs, 
+                color_bounds=_color_bounds, 
+                lon_grid=_cleaned_lon_grid, 
+                lat_grid=_cleaned_lat_grid
+                )
         return
     
     # def animate_fisheye(self):
@@ -184,7 +245,6 @@ class Imagers:
         color_map: str = None,
         color_bounds: List[float] = None,
         color_norm: str = None,
-        color_brighten: bool = True,
         min_elevation: float = 10,
         pcolormesh_kwargs: dict = {},
         asi_label: bool = True,
@@ -293,9 +353,6 @@ class Imagers:
             >>>         bbox=dict(facecolor='grey', edgecolor='black'))
             
         """
-        if not overlap:
-            self._calc_overlap_mask()
-
         if ax is None:
             ax = asilib.map.create_map(
                 lon_bounds=lon_bounds,
@@ -304,6 +361,25 @@ class Imagers:
                 land_color=land_color,
                 ocean_color=ocean_color,
             )
+
+        # Handle manual color_bounds for none, all, or each imager.
+        if color_bounds is None:
+            color_bounds = np.full(len(self.imagers), None)
+        elif len(np.array(color_bounds).shape) == 1:  # Same color_bounds for all imagers.
+            color_bounds = np.repeat(
+                np.array(color_bounds)[:, np.newaxis], 
+                len(self.imagers), 
+                axis=-1
+                ).T
+        elif len(np.array(color_bounds).shape) == 2:
+            assert np.array(color_bounds).shape == (len(self.imagers), 2), (
+                "A unique color_bounds must be specified for each imager."
+                )
+        else:
+            raise ValueError(
+                f'The shape of color_bounds must be (1, 2), or '
+                f'({len(self.imagers)}, 2), not {np.array(color_bounds).shape}'
+                )
 
         # Create the animation directory inside asilib.config['ASI_DATA_DIR'] if it does
         # not exist.
@@ -336,20 +412,56 @@ class Imagers:
             iter_length=self.imagers[0]._estimate_n_times(),
             text=self.animation_name,
         )
+        operating_asis = np.array([])
 
         for i, (_guide_time, _asi_times, _asi_images) in _progressbar:
             asi_labels = len(self.imagers)*[None]
             pcolormesh_objs = len(self.imagers)*[None]
+
+            # Determine if an imager turned off/on and we need to recalculate overlapping skymaps.
+            currently_on_asis = np.where(np.array(_asi_times) != datetime.min)[0].astype(int)
+            if (currently_on_asis.shape != operating_asis.shape) or np.any(currently_on_asis != operating_asis):
+                _skymaps = {}
+                for j in currently_on_asis:
+                    imager = self.imagers[j]
+                    _skymaps[imager.meta['location']] = {
+                        'lon':imager.skymap['lon'].copy(), 
+                        'lat':imager.skymap['lat'].copy()
+                    }
+
+                if not overlap:
+                    _skymaps = self._calc_overlap_mask(_skymaps, idx=currently_on_asis)
+
+                for j in currently_on_asis:
+                    imager = self.imagers[j]
+                    _skymap_cleaner = Skymap_Cleaner(
+                        _skymaps[imager.meta['location']]['lon'], 
+                        _skymaps[imager.meta['location']]['lat'], 
+                        imager.skymap['el'],
+                    )
+                    _skymap_cleaner.mask_elevation(min_elevation=min_elevation)
+                    _cleaned_lon_grid, _cleaned_lat_grid = _skymap_cleaner.remove_nans()
+                    _skymaps[imager.meta['location']]['lon'] = _cleaned_lon_grid
+                    _skymaps[imager.meta['location']]['lat'] = _cleaned_lat_grid
+                operating_asis = currently_on_asis
+
             for j, (_asi_time, _asi_image) in enumerate(zip(_asi_times, _asi_images)):
                 if _asi_time == datetime.min:
                     continue
                 _color_map, _color_norm = self.imagers[j]._plot_params(
-                    _asi_image, color_bounds, color_map, color_norm
+                    _asi_image, color_bounds[j], color_map, color_norm
                     )
 
                 ax, pcolormesh_objs[j], asi_labels[j] = self.imagers[j]._plot_mapped_image(
-                    ax, _asi_image, min_elevation, _color_map, _color_norm, color_brighten, asi_label, 
-                    pcolormesh_kwargs
+                    ax, 
+                    _asi_image, 
+                    min_elevation, 
+                    _color_map, 
+                    _color_norm, 
+                    asi_label, 
+                    pcolormesh_kwargs, 
+                    lon_grid=_skymaps[self.imagers[j].meta['location']]['lon'], 
+                    lat_grid=_skymaps[self.imagers[j].meta['location']]['lat']
                 )
 
             # Give the user the control of the subplot, image object, and return the image time
@@ -371,6 +483,145 @@ class Imagers:
         
         self.imagers[0]._create_animation(image_paths, movie_save_path, ffmpeg_params, overwrite)
         return
+    
+    def map_eq(self, b_model: Callable='IGRF') -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Map an auroral image to the magnetic equator using IGRF or a user-defined magnetic field model.
+
+        Parameters
+        ----------
+        b_model: Callable
+            A function with the (time, lla) arguments where time is a single time stamp, 
+            and lla is one (lat, lon, alt) point. If ``b_model='IGRF'``, IRBEM's IGRF model is used
+            in the default GSM coordinates.
+
+        Returns
+        -------
+        numpy.ndarray:
+            Mapped locations in the Geocentric Solar Magnetospheric (GSM) coordinates.
+        numpy.ndarray:
+            Auroral pixel intensities.
+        """
+        warnings.warn(
+            'asilib.Imagers.map_eq() is an experimental method. Its functionality or interface '
+            'stability is not guaranteed.'
+            )
+        if b_model == 'IGRF':
+            b_model = self._igrf_model_wrapper
+            if not _irbem_imported:
+                raise ImportError(
+                    'IRBEM is not installed. Please install it to use the IGRF model, '
+                    'or supply a custom b_model.'
+                    )
+            
+        lats_lons, intensities = self.get_points()
+        equator_sm = np.zeros((lats_lons[:, 0].shape[0], 3))
+
+        _progressbar = asilib.utils.progressbar(
+            enumerate(zip(lats_lons[:, 0], lats_lons[:, 1])),
+            iter_length=lats_lons[:, 0].shape[0],
+            text='Mapping to magnetic equator'
+            )
+
+        for i, (lat, lon) in _progressbar:
+            equator_sm[i, :] = b_model(self.imagers[0].file_info['time'], (lat, lon, self.imagers[0].skymap['alt']))
+        return equator_sm, intensities
+    
+    def plot_map_eq(
+            self, 
+            ax:plt.Axes=None, 
+            b_model:Callable="IGRF",
+            max_valid_grid_distance:float=0.03,
+            x_grid:np.ndarray=None, 
+            y_grid:np.ndarray=None, 
+            color_bounds: List[float] = None,
+            color_norm: str = None,
+            color_map: str = None,
+            pcolormesh_kwargs:dict={},
+            ) -> Tuple[plt.Axes, matplotlib.collections.QuadMesh]:
+        """
+        Plot the equatorial projection of an auroral image, mapped using IGRF or a user-defined 
+        magnetic field model.
+
+        Parameters
+        ----------
+        ax: plt.Axes
+            The subplot to put the map on. If None, one will be created.
+        b_model: Callable
+            A function with the (time, lla) arguments where time is a single time stamp, 
+            and lla is one (lat, lon, alt) point. If ``b_model='IGRF'``, IRBEM's IGRF model is used
+            in the default GSM coordinates.
+        max_valid_grid_distance: float
+            The maximum distance from the mapped point to the grid point. If the distance is greater
+            than this value, the mapped grid point will be masked as NaN. The distance is in units of Re.
+        x_grid, x_grid: np.ndarray
+            The x and y grid points to plot the mapped image. If None, a grid of 1000x1001 points spanning 
+            -12 < x < 1.1 and -5 < y < 5 is generated.
+        color_bounds: List[float]
+            The ASI image color bounds.
+        color_map: str
+            The matplotlib colormap to use. See `matplotlib colormaps <https://matplotlib.org/stable/tutorials/colors/colormaps.html>`_
+            for supported colormaps.
+        color_norm: str
+            Set the 'lin' (linear) or 'log' (logarithmic) color normalization. If color_norm=None,
+            the color normalization will be taken from the ASI array (log for black & white images 
+            and linear for RGB images).
+        pcolormesh_kwargs: dict
+            Keyword arguments directly passed into plt.pcolormesh.
+        """
+        if ax is None:
+            _, ax = plt.subplots()
+        if (x_grid is None) and (y_grid is None):
+            x_grid, y_grid = np.meshgrid(np.linspace(-12, 1.1, num=1000), np.linspace(-5, 5, num=1001))
+
+        equator_sm, intensities = self.map_eq(b_model=b_model)
+
+        gridded_eq_data = scipy.interpolate.griddata(
+            equator_sm[:, :2], 
+            intensities, 
+            (x_grid, y_grid), 
+            method='nearest'
+            )
+        # https://stackoverflow.com/a/31189177
+        tree = cKDTree(equator_sm[:, :2])
+        dists, _ = tree.query(np.stack((x_grid, y_grid), axis=-1))
+        gridded_eq_data[dists > max_valid_grid_distance, :] = np.nan  # Mask any gridded point > 0.1 Re from the mapped point as NaN
+
+        color_map, color_norm = self.imagers[0]._plot_params(gridded_eq_data, color_bounds, color_map, color_norm)
+
+        vmin, vmax = self.imagers[0].plot_settings['color_bounds']
+        if len(self.imagers[0].meta['resolution']) == 3:
+            vmin, vmax = self.imagers[0].get_color_bounds()
+            gridded_eq_data = self.imagers[0]._rgb_replacer(gridded_eq_data)
+            gridded_eq_data = asilib.utils.stretch_contrast(gridded_eq_data, vmin, vmax)
+
+            # Add a transprancy channel so that the NaN RGB values show up as transparent instead of black.
+            gridded_eq_data = np.concatenate(
+                (gridded_eq_data, np.ones(gridded_eq_data.shape[:2]).reshape(*gridded_eq_data.shape[:2], 1))
+                , axis=-1
+                )
+            gridded_eq_data[np.isnan(gridded_eq_data.sum(axis=-1)), -1] = 0
+
+        pcolormesh_kwargs['norm'] = color_norm
+        pcolormesh_kwargs['cmap'] = color_map
+        gridded_eq_data = np.ma.array(gridded_eq_data, mask=np.isnan(gridded_eq_data))
+        p = ax.pcolormesh(x_grid, y_grid, gridded_eq_data, **pcolormesh_kwargs)
+
+        # Draw Earth circle
+        ax.add_artist(matplotlib.patches.Wedge((0, 0), 1, -90, 90, fc='w', ec='k'))
+        ax.add_artist(matplotlib.patches.Wedge((0, 0), 1, 90, 270, fc='k', ec='k'))
+        return ax, p
+
+    def _igrf_model_wrapper(self, time, lla):
+        if not hasattr(self, '_irbem_obj'):
+            self._irbem_obj = IRBEM.MagFields(kext=0)
+            self._coords_obj = IRBEM.Coords()
+        output_dictionary = self._irbem_obj.find_magequator(
+            {'datetime':time, 'x1':lla[2], 'x2':lla[0], 'x3':lla[1]},
+            {}
+            )
+        equator_gsm = self._coords_obj.transform(time, output_dictionary['XGEO'], 1, 2)  # Convert to GSM coordinates
+        return equator_gsm
     
     def __iter__(self) -> Generator[datetime, List, List]:
         """
@@ -408,8 +659,6 @@ class Imagers:
             }
         future_iterators = {}
         stopped_iterators = []
-
-        # TODO: Recalculate the skymaps if an imager is delayed or turned off.
 
         for guide_time in times:
             _asi_times = []
@@ -528,32 +777,42 @@ class Imagers:
         else:  # single-color (or white light)
             intensities  = np.zeros(0, dtype=float)
 
-        self._calc_overlap_mask()
+        _skymaps = {}
+        for imager in self.imagers:
+            _skymaps[imager.meta['location']] = {
+                'lon':imager.skymap['lon'].copy(), 
+                'lat':imager.skymap['lat'].copy()
+            }
+        _skymaps = self._calc_overlap_mask(_skymaps)
 
         for _imager in self.imagers:
             assert 'time' in _imager.file_info.keys(), (
                 f'Imagers.get_points() only works with single images.'
                 )
-            image = _imager.data.image
-            _masked_lon_map, _masked_lat_map, _masked_image = _imager._mask_low_horizon(
-                _imager.skymap['lon'], _imager.skymap['lat'], _imager.skymap['el'], min_elevation, 
-                image=image
+            _skymap_cleaner = Skymap_Cleaner(
+                _skymaps[_imager.meta['location']]['lon'], 
+                _skymaps[_imager.meta['location']]['lat'], 
+                _imager.skymap['el'],
             )
-            if _imager.skymap['lon'].shape[0] == image.shape[0] + 1:
+            _masked_lon_map, _masked_lat_map, _ = _skymap_cleaner.mask_elevation(
+                min_elevation=min_elevation
+                )
+
+            if _imager.skymap['lon'].shape[0] == _imager.data.image.shape[0] + 1:
                 # Skymap defines vertices. We look for NaNs at either of the pixel edges.
                 _valid_idx = np.where(
                     ~np.isnan(_masked_lon_map[1:, 1:]-_masked_lon_map[:-1, :-1])
                     )
-            elif _imager.skymap['lon'].shape[0] == image.shape[0]:
+            elif _imager.skymap['lon'].shape[0] == _imager.data.image.shape[0]:
                 # Skymap defines pixel centers
                 _valid_idx = np.where(~np.isnan(_masked_lon_map))
             else:
                 raise ValueError(f'The skymap shape: {_imager.skymap["lon"].shape} and image '
-                                 f'shape: {image.shape} are incompatible.')
+                                 f'shape: {_imager.data.image.shape} are incompatible.')
 
             lat_grid = _masked_lat_map[_valid_idx[0], _valid_idx[1]]
             lon_grid = _masked_lon_map[_valid_idx[0], _valid_idx[1]]
-            intensity = _masked_image[_valid_idx[0], _valid_idx[1], ...]
+            intensity = _imager.data.image[_valid_idx[0], _valid_idx[1], ...]
 
             # Concatenate joins arrays along an existing axis, while stack joins arrays
             # along a new axis. 
@@ -564,7 +823,7 @@ class Imagers:
                 ))
         return lat_lon_points, intensities
     
-    def _calc_overlap_mask(self):
+    def _calc_overlap_mask(self, _skymaps, idx=None, shrink_distance_to_self=0.98):
         """
         Calculate which pixels to plot for overlapping imagers by the criteria that the ith 
         imager's pixel must be closest to that imager (and not a neighboring one).
@@ -580,34 +839,117 @@ class Imagers:
         7. If the minimum j is not the ith imager, mask the imager.skymap['lat'] and 
         imager.skymap['lon'] as np.nan.
         """
-        if hasattr(self, '_masked'):
-            return
+        # This variable keeps track of all imagers in case their field of view is clipped
+        # by the CCD (TREx-RGB, for example has this). If at least one imager's FOV is 
+        # clipped, it will run an additional step to check if some of the pixels to be removed
+        # from one imager are not in the clipped region of the other imager.
+        clipped_fov=False
 
-        for i, imager in enumerate(self.imagers):
-            _distances = np.nan*np.ones((*imager.skymap['lat'].shape, len(self.imagers)))
-            for j, other_imager in enumerate(self.imagers):
+        if idx is None:
+            _imagers = self.imagers
+        else:
+            _imagers = [self.imagers[i] for i in idx]
+
+        for imager in _imagers:
+            merged_edges = np.concatenate((
+                _skymaps[imager.meta['location']]['lat'][0, :], 
+                _skymaps[imager.meta['location']]['lat'][-1, :], 
+                _skymaps[imager.meta['location']]['lat'][:, 0], 
+                _skymaps[imager.meta['location']]['lat'][:, -1]
+                ))
+            if not np.all(np.isnan(merged_edges)):
+                clipped_fov=True
+                # Save the clipped (lats, lon) to compare with here.
+
+        for i, imager in enumerate(_imagers):
+            _distances = np.nan*np.ones(
+                (*_skymaps[imager.meta['location']]['lat'].shape, len(_imagers))
+                )
+            for j, other_imager in enumerate(_imagers):
                 # Calculate the distance between all imager pixels and every other imager 
                 # location (including itself).
-                _distances[:, :, j] = _haversine(
-                    imager.skymap['lat'], imager.skymap['lon'],
-                    np.broadcast_to(other_imager.meta['lat'], imager.skymap['lat'].shape), 
-                    np.broadcast_to(other_imager.meta['lon'], imager.skymap['lat'].shape)
+                _other_lon = np.broadcast_to(
+                    other_imager.meta['lon'], 
+                    _skymaps[imager.meta['location']]['lat'].shape
                     )
+                _other_lat = np.broadcast_to(
+                    other_imager.meta['lat'], 
+                    _skymaps[imager.meta['location']]['lat'].shape
+                    )
+
+                _distances[:, :, j] = _haversine(
+                    _skymaps[imager.meta['location']]['lat'], 
+                    _skymaps[imager.meta['location']]['lon'],
+                    _other_lat, 
+                    _other_lon
+                    )
+                
+                # _distances[:, :, i] = 0
             # Without this small reduction in the distance of pixels to its own imager,
             # there are gaps between the imager boundaries. In other words, this scaling
             # slightly biases to plotting pixels nearest to the imager. 
-            _distances[:, :, i] *= 0.95
+            _distances[:, :, i] *= shrink_distance_to_self
+            # TODO: Set the _distances[:, :, i] values to 0 (not masked out) if they are 
+            # #closer to the other imager but the other imager's pixels are nans.
             # Need a masked array so that np.nanargmin correctly handles all NaN slices.
             _distances = np.ma.masked_array(_distances, np.isnan(_distances))
             # For each pixel, calculate the nearest imager. If the pixel is not closest to 
-            # the imager that it's from, mask it as np.nan. Then the Imager._pcolormesh_nan() 
-            # method then won't plot that pixel.
+            # the imager that it's from, mask it as np.nan.
             min_distances = np.argmin(_distances, axis=2)
             far_pixels = np.where(min_distances != i)
-            imager.skymap['lat'][far_pixels] = np.nan
-            imager.skymap['lon'][far_pixels] = np.nan
-        self._masked = True  # A flag to not run again.
-        return
+
+            # if clipped_fov and (far_pixels[0].shape[0] > 0):
+            #     far_pixels = self._valid_far_pixels(i, _skymaps, far_pixels)
+
+            _skymaps[imager.meta['location']]['lat'][far_pixels] = np.nan
+            _skymaps[imager.meta['location']]['lon'][far_pixels] = np.nan
+
+            # TODO: Add an option to return the skymaps with just the overlapping part.
+        return _skymaps
+    
+    def _valid_far_pixels(self, imager_id, _skymaps, far_pixels):
+        """
+        Sometimes for imagers with clipped FOV the far pixel from the main imager falls inside 
+        the clipped region. This loop checks that these far pixels are not in the clipped FOV.
+        """
+        imager = self.imagers[imager_id]
+        valid_far_pixels = []
+
+        _progressbar = asilib.utils.progressbar(
+            enumerate(zip(far_pixels[0], far_pixels[1])),
+            iter_length=far_pixels[0].shape[0],
+            text='Processing clipped FOV pixels',
+        )
+        for i, far_pixel in _progressbar:
+            _lon = _skymaps[imager.meta['location']]['lon'][far_pixel]
+            _lat = _skymaps[imager.meta['location']]['lat'][far_pixel]
+            
+            for k, other_imager in enumerate(self.imagers):
+                if k==i:
+                    continue
+                _lon_arr = np.broadcast_to(
+                    _lon, 
+                    _skymaps[other_imager.meta['location']]['lon'].shape
+                )
+                _lat_arr = np.broadcast_to(
+                    _lat, 
+                    _skymaps[other_imager.meta['location']]['lat'].shape
+                )
+                _other_lon_arr = _skymaps[other_imager.meta['location']]['lon']
+                _other_lat_arr = _skymaps[other_imager.meta['location']]['lat']
+                _distances_other_imager = _haversine(
+                    _other_lon_arr,
+                    _other_lat_arr,
+                    _lat_arr,
+                    _lon_arr
+                    )
+                idx_other = np.unravel_index(
+                    np.argmin(_distances_other_imager), 
+                    _skymaps[other_imager.meta['location']]['lon'].shape
+                    )
+                if _distances_other_imager[idx_other] < 100:
+                    valid_far_pixels.append(far_pixel)
+        return np.array(valid_far_pixels).astype(int)
     
     def __str__(self):
         names = [f'{_img.meta["array"]}-{_img.meta["location"]}' for _img in self.imagers]
@@ -627,60 +969,3 @@ class Imagers:
             raise ValueError(
                 'The 0th imager object does not have a "time" or a "time_range" variable.'
                 )
-    
-
-if __name__ == '__main__':
-    # """
-    # Animate a THEMIS ASI mosaic from Jones+2013 (https://doi.org/10.1002/jgra.50301)
-    # """
-    # import asilib
-    # import asilib.asi
-
-    # time_range = ('2008-02-11T04:22', '2008-02-11T04:45')
-    # location_codes = [
-    #     'INUV', 'FSIM', 'PGEO', 'FSMI', 'FSIM', 'ATHA', 'RANK', 'GILL', 'SNKQ', 'KUUJ'
-    # ]
-    # asi_list = []
-
-    # for location_code in location_codes:
-    #     asi_list.append(asilib.asi.themis(location_code, time_range=time_range))
-
-    # asis = asilib.Imagers(asi_list)
-    # gen = asis.animate_map_gen(overwrite=True)
-    # for guide_time, asi_times, asi_images, ax in gen:
-    #     if '_text_obj' in locals():
-    #         _text_obj.remove()  # noqa: F821
-    #     info_str = f'Time: {guide_time: %Y:%m:%d %H:%M:%S}'
-
-    #     _text_obj = ax.text(
-    #         0.01, 0.99, info_str, va='top', transform=ax.transAxes, 
-    #         bbox=dict(facecolor='grey', edgecolor='black'))
-
-    """
-    Animate a REGO ASI mosaic from Panov+2019 (https://doi.org/10.1029/2019JA026521)
-    """
-    import matplotlib.pyplot as plt
-
-    import asilib
-    import asilib.asi
-    import asilib.map
-
-    time_range = ('2016-08-09T08:00', '2016-08-09T09:00')
-    asi_list = []
-
-    for location_code in ['GILL', 'FSMI', 'FSIM']:
-        asi_list.append(asilib.asi.rego(location_code, time_range=time_range))
-
-    ax = asilib.map.create_cartopy_map(lon_bounds=(-130, -87), lat_bounds=(51, 65))
-    plt.tight_layout()
-
-    asis = asilib.Imagers(asi_list)
-    gen = asis.animate_map_gen(overwrite=True, ax=ax)
-    for guide_time, asi_times, asi_images, ax in gen:
-        if '_text_obj' in locals():
-            _text_obj.remove()  # noqa: F821
-        info_str = f'Time: {guide_time: %Y:%m:%d %H:%M:%S}'
-
-        _text_obj = ax.text(
-            0.01, 0.99, info_str, va='top', transform=ax.transAxes, 
-            bbox=dict(facecolor='grey', edgecolor='black'))

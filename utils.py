@@ -155,6 +155,7 @@ def stretch_contrast(image, vmin, vmax):
 
     To not apply this algorithm use vmin=0 and vmax=256 for 8-bit images (i.e., TREx).
     """
+    image[image == -2147483648] = 0 #this makes it so nans (which are -2147... in integer form) turn to 0
     image = (image-vmin)/(vmax-vmin)
     # Above is a good enough scaling, but there may be some >1 values since vmin, vmax 
     # are percentiles (it better handles cases when part of the image is saturated by 

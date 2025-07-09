@@ -163,13 +163,18 @@ class Imager:
         color_map, color_norm = self._plot_params(image, color_bounds, color_map, color_norm)
 
         if len(self.meta['resolution']) == 3:  # tests if rgb
-            vmin, vmax = self.get_color_bounds()
             image = self._rgb_replacer(image)
+            if color_bounds !=None:
+                vmin, vmax = color_bounds
+            else: 
+                vmin, vmax = self.get_color_bounds()
             image = utils.stretch_contrast(image, vmin, vmax)
+            
         if isinstance(color_norm, matplotlib.colors.LogNorm):
             # Increase the corner pixels with 0 counts to 1 count so 
             # it shows up black in log-scale.
             image[np.where(np.isnan(image))] = 1
+
         im = ax.imshow(image, cmap=color_map, norm=color_norm, origin="lower")
         if label:
             self._add_fisheye_label(time, ax)
@@ -395,8 +400,11 @@ class Imager:
             _color_map, _color_norm = self._plot_params(image, color_bounds, color_map, color_norm)
             
             if len(self.meta['resolution']) == 3:  # tests if rgb
-                vmin, vmax = self.get_color_bounds()
                 image = self._rgb_replacer(image)
+                if color_bounds !=None:
+                    vmin, vmax = color_bounds
+                else: 
+                    vmin, vmax = self.get_color_bounds()
                 image = utils.stretch_contrast(image, vmin, vmax)
 
             if isinstance(color_norm, matplotlib.colors.LogNorm):
@@ -530,13 +538,13 @@ class Imager:
         color_map, color_norm = self._plot_params(image, color_bounds, color_map, color_norm)
 
         ax, p, _ = self._plot_mapped_image(
-            ax, image, min_elevation, color_map, color_norm, asi_label, 
+            ax, image, min_elevation, color_map, color_norm, color_bounds, asi_label, 
             pcolormesh_kwargs, lon_grid=lon_grid, lat_grid=lat_grid
         )
         return ax, p
 
     def _plot_mapped_image(
-        self, ax, image, min_elevation, color_map, color_norm, asi_label, 
+        self, ax, image, min_elevation, color_map, color_norm, color_bounds, asi_label, 
         pcolormesh_kwargs, lon_grid=None, lat_grid=None
     ):
         """
@@ -554,11 +562,17 @@ class Imager:
             _cleaned_lon_grid, _cleaned_lat_grid = lon_grid, lat_grid
 
 
-        if len(self.meta['resolution']) == 3:
-            vmin, vmax = self.get_color_bounds()
+        if len(self.meta['resolution']) == 3:  # tests if rgb
             image = self._rgb_replacer(image)
+            if color_bounds !=None:
+                vmin, vmax = color_bounds
+            else: 
+                vmin, vmax = self.get_color_bounds()
             image = utils.stretch_contrast(image, vmin, vmax)
-
+        if isinstance(color_norm, matplotlib.colors.LogNorm) :
+            # Increase the corner pixels with 0 counts to 1 count so 
+            # it shows up black in log-scale.
+            image[np.where(np.isnan(image))] = 1
         pcolormesh_kwargs_copy = pcolormesh_kwargs.copy()
         if cartopy_imported and isinstance(ax, cartopy.mpl.geoaxes.GeoAxes):
             assert 'transform' not in pcolormesh_kwargs.keys(), (
@@ -1052,8 +1066,12 @@ class Imager:
         _keogram = np.moveaxis(_keogram, 0, 1)  # Transpose 0th and 1st axes for pcolormesh. 
         if len(self.meta['resolution']) == 3:  # tests if rgb
             _keogram = self._rgb_replacer(_keogram)
-            vmin, vmax = self.get_color_bounds()
+            if color_bounds !=None:
+                vmin, vmax = color_bounds
+            else: 
+                vmin, vmax = self.get_color_bounds()
             _keogram = utils.stretch_contrast(_keogram, vmin, vmax)
+
             
 
         pcolormesh_obj = ax.pcolormesh(
@@ -1796,6 +1814,7 @@ class Imager:
                 image[..., 1] = np.full(np.shape(image)[:-1], np.nan)
             if 'b' not in (*self.meta['colors'],):
                 image[..., 2] = np.full(np.shape(image)[:-1], np.nan)
+            image= image.astype(int)
         return image
 
 class Skymap_Cleaner:

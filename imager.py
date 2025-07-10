@@ -836,7 +836,7 @@ class Imager:
             _color_map, _color_norm = self._plot_params(image, color_bounds, color_map, color_norm)
 
             ax, pcolormesh_obj, label_obj = self._plot_mapped_image(
-                ax, image, min_elevation, _color_map, _color_norm, asi_label, 
+                ax, image, min_elevation, _color_map, _color_norm, color_bounds, asi_label, 
                 pcolormesh_kwargs, lon_grid=lon_grid, lat_grid=lat_grid
             )
 
